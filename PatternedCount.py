@@ -271,12 +271,18 @@ def run(context):
             # Get the component containing the sketch
             comp = sketch.parentComponent
 
-            # Collect all text bounding boxes before exploding
+            # Collect all text bounding boxes and their numbers before exploding
             text_boxes = []
             for i in range(texts.count):
                 t = texts.item(i)
                 bb = t.boundingBox
-                text_boxes.append((bb.minPoint, bb.maxPoint))
+                # Get the number from the text content
+                text_content = t.text
+                text_boxes.append({
+                    'min': bb.minPoint,
+                    'max': bb.maxPoint,
+                    'number': text_content
+                })
 
             # Explode all texts to create actual curve profiles
             # (Note: this is destructive - texts become curves)
@@ -341,12 +347,16 @@ def run(context):
                     pass
                 return False
 
-            # Helper to check if a profile is a valid text character
-            def is_text_profile(profile):
+            # Collect valid text profiles with their bounding boxes
+            valid_profiles = []
+            profiles = sketch.profiles
+
+            for i in range(profiles.count):
+                profile = profiles.item(i)
                 try:
                     # Skip profiles that contain projected geometry
                     if has_projected_curves(profile):
-                        return False
+                        continue
 
                     area_props = profile.areaProperties()
                     centroid = area_props.centroid
@@ -355,81 +365,166 @@ def run(context):
 
                     # Skip profiles that are too large (likely outer boundaries)
                     if area > max_char_area:
-                        return False
+                        continue
 
-                    for (min_pt, max_pt) in text_boxes:
+                    # Check if centroid is in any text box
+                    matched_number = None
+                    for tb in text_boxes:
+                        min_pt, max_pt = tb['min'], tb['max']
                         if (min_pt.x <= cx <= max_pt.x and
                             min_pt.y <= cy <= max_pt.y):
-                            return True
+                            matched_number = tb['number']
+                            break
+
+                    if matched_number is not None:
+                        # Get profile bounding box
+                        bb = profile.boundingBox
+                        valid_profiles.append({
+                            'profile': profile,
+                            'area': area,
+                            'centroid': (cx, cy),
+                            'min': (bb.minPoint.x, bb.minPoint.y),
+                            'max': (bb.maxPoint.x, bb.maxPoint.y),
+                            'number': matched_number
+                        })
                 except:
                     pass
-                return False
 
-            profiles = sketch.profiles
-            if profiles.count == 0:
+            # Filter out inner profiles (holes inside other profiles)
+            # A profile is an "inner hole" if its bounding box is fully contained within another profile's bounding box
+            def is_contained_in(inner, outer):
+                return (outer['min'][0] < inner['min'][0] and
+                        outer['min'][1] < inner['min'][1] and
+                        outer['max'][0] > inner['max'][0] and
+                        outer['max'][1] > inner['max'][1])
+
+            outer_profiles = []
+            for p in valid_profiles:
+                is_inner = False
+                for other in valid_profiles:
+                    if p is not other and is_contained_in(p, other):
+                        is_inner = True
+                        break
+                if not is_inner:
+                    outer_profiles.append(p)  # Keep full dict with number
+
+            profiles_in_text = len(outer_profiles)
+
+            if len(outer_profiles) == 0:
                 ui.messageBox(
                     'PatternedCount:\n'
-                    'No profiles found in sketch. Cannot create cuts/bodies.\n'
+                    'No valid text profiles found in sketch. Cannot create cuts/bodies.\n'
                     'Ensure the sketch is on a face of an existing body.'
                 )
             else:
                 extrudes = comp.features.extrudeFeatures
-                cut_idx = 0
+                cuts_created = 0
+                cut_errors = []
+                body_errors = []
 
-                for i in range(profiles.count):
-                    profile = profiles.item(i)
+                # Collect all outer profiles into an ObjectCollection for a single operation
+                # Also build a list of numbers in the same order
+                profile_collection = adsk.core.ObjectCollection.create()
+                profile_numbers = []
+                for p in outer_profiles:
+                    profile_collection.add(p['profile'])
+                    profile_numbers.append(p['number'])
 
-                    # Only process profiles that are valid text characters
-                    if not is_text_profile(profile):
-                        continue
-                    profiles_in_text += 1
-
-                    # Create cut into body
+                # Create a single cut with all profiles
+                if profile_collection.count > 0:
                     cut_input = extrudes.createInput(
-                        profile,
+                        profile_collection,
                         adsk.fusion.FeatureOperations.CutFeatureOperation
                     )
                     cut_distance = adsk.core.ValueInput.createByReal(-cut_depth)
                     cut_input.setDistanceExtent(False, cut_distance)
                     try:
                         cut_feature = extrudes.add(cut_input)
-                        cut_feature.name = f"{GENERATED_PREFIX}cut_{cut_idx}"
-                    except:
-                        # Profile might not intersect a body - skip
-                        continue
+                        cut_feature.name = f"{GENERATED_PREFIX}cuts"
+                        cuts_created = profile_collection.count
+                    except Exception as e:
+                        cut_errors.append(str(e))
 
-                    # Create new body by extruding from the cut bottom
-                    # Use offset start to begin at -cut_depth, extrude up by cut_depth
-                    try:
-                        body_input = extrudes.createInput(
-                            profile,
-                            adsk.fusion.FeatureOperations.NewBodyFeatureOperation
-                        )
-                        # Set start offset to -cut_depth (down into the cut)
-                        start_offset = adsk.core.ValueInput.createByReal(-cut_depth)
-                        body_input.startExtent = adsk.fusion.OffsetStartDefinition.create(start_offset)
-                        body_distance = adsk.core.ValueInput.createByReal(cut_depth)
-                        body_input.setDistanceExtent(False, body_distance)
-                        body_feature = extrudes.add(body_input)
-                        body_feature.name = f"{GENERATED_PREFIX}body_{cut_idx}"
-                        bodies_created += 1
-                    except:
-                        pass
+                    # Create new bodies from the cut's end faces (bottom of pockets)
+                    if cuts_created > 0:
+                        try:
+                            # Get the end faces created by the cut
+                            end_faces = cut_feature.endFaces
+                            end_face_count = end_faces.count
 
-                    cut_idx += 1
+                            # Get sketch transform to convert model coords to sketch coords
+                            sketch_transform = sketch.transform
+                            sketch_transform_inv = sketch_transform.copy()
+                            sketch_transform_inv.invert()
+
+                            # Add small tolerance for centroid matching
+                            tol = pitch * 0.5
+
+                            for j in range(end_face_count):
+                                face = end_faces.item(j)
+                                try:
+                                    # Find which number this face corresponds to by matching centroid to text boxes
+                                    face_centroid = face.centroid
+
+                                    # Transform face centroid from model space to sketch space
+                                    sketch_centroid = face_centroid.copy()
+                                    sketch_centroid.transformBy(sketch_transform_inv)
+                                    fcx, fcy = sketch_centroid.x, sketch_centroid.y
+
+                                    face_number = None
+                                    for tb in text_boxes:
+                                        min_pt, max_pt = tb['min'], tb['max']
+                                        # Use tolerance for matching
+                                        if (min_pt.x - tol <= fcx <= max_pt.x + tol and
+                                            min_pt.y - tol <= fcy <= max_pt.y + tol):
+                                            face_number = tb['number']
+                                            break
+
+                                    body_input = extrudes.createInput(
+                                        face,
+                                        adsk.fusion.FeatureOperations.NewBodyFeatureOperation
+                                    )
+                                    # Extrude up by cut_depth from the face
+                                    body_distance = adsk.core.ValueInput.createByReal(cut_depth)
+                                    body_input.setDistanceExtent(False, body_distance)
+                                    body_feature = extrudes.add(body_input)
+
+                                    # Name the feature (for timeline) with our prefix
+                                    body_feature.name = f"{GENERATED_PREFIX}body_{j}"
+
+                                    # Name only the newly created bodies (not existing ones)
+                                    # NewBodyFeatureOperation creates exactly one new body
+                                    if body_feature.bodies.count > 0:
+                                        new_body = body_feature.bodies.item(0)
+                                        if face_number is not None:
+                                            new_body.name = f"n{face_number}"
+
+                                    bodies_created += 1
+                                except Exception as e:
+                                    body_errors.append(f"Face {j}: {str(e)}")
+                        except Exception as e:
+                            body_errors.append(str(e))
 
         # --- Report results ---
-        msg = f'PatternedCount: Created {seg_count} numbers starting at {start_number}.'
+        msg = f'PatternedCount: Created {seg_count} sketch text numbers starting at {start_number}.'
         if cut_depth and cut_depth > 0:
-            msg += f'\nCut/body pairs created: {bodies_created}'
+            msg += f'\nValid profiles: {len(valid_profiles)}, outer (non-hole): {profiles_in_text}'
+            msg += f'\nCuts: {cuts_created}, Bodies: {bodies_created}'
+            if cut_errors:
+                msg += f'\nCut errors: {cut_errors[0]}'
+            if body_errors:
+                msg += f'\nBody errors: {body_errors[0]}'
         ui.messageBox(msg)
 
-        # Group all timeline operations into one undo step
+        # Group all timeline operations into one undo step (needs at least 2 features)
         if timeline_start is not None:
             timeline_end = timeline.markerPosition
-            if timeline_end > timeline_start:
-                timeline_group = timeline.timelineGroups.add(timeline_start, timeline_end - 1)
-                timeline_group.name = "PatternedCount"
+            if timeline_end - timeline_start >= 2:
+                try:
+                    timeline_group = timeline.timelineGroups.add(timeline_start, timeline_end - 1)
+                    timeline_group.name = "PatternedCount"
+                except:
+                    pass  # Grouping failed, not critical
 
     except Exception:
         if ui:
