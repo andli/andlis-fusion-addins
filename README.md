@@ -6,7 +6,7 @@ The add-in reads your user parameters and a single template Sketch Text entity, 
 
 This is ideal for multi-material 3D printed projects where each digit needs its own cutout and body.
 
----
+ ![Example](example.png)
 
 ## Features
 
