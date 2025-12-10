@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "script",
+    "author": "Andreas Limber",
+    "description": {
+        "": "Automatically generates numbered sketch text sequences for patterned counter segments. Ideal for multi-material 3D printed projects like sliding counters and dial indicators."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
