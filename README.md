@@ -12,6 +12,8 @@ Automatically generates numbered text sequences for sliding counters, dial indic
 
 ![PatternedCount Linear](PatternedCount/example-linear.png)
 ![PatternedCount Circular](PatternedCount/example-circle.png)
+![HexPattern Example](HexPattern/example.png)
+
 
 ### HexPattern
 
