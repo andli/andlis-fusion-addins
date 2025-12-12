@@ -2,13 +2,9 @@
 # Cuts a honeycomb pattern of hexagons from a selected rectangular face.
 #
 # Usage:
-# 1. Create user parameters:
-#    - hexNumX    (unitless int) - number of hexagons along the selected edge
-#    - hexMargin  (length, e.g. 0.5 mm) - space between hexagons
-#    - hexPointyTop (optional, text) - "TRUE" for flat-top hexes instead of default pointy-top
-#
-# 2. Select an edge on a rectangular face (defines width direction for hexNumX)
-# 3. Run this script from Scripts & Add-Ins
+# 1. Select an edge on a rectangular face (defines width direction for hex count)
+# 2. Run this script from Scripts & Add-Ins
+# 3. Enter parameters in the dialog that appears
 
 import adsk.core
 import adsk.fusion
@@ -18,18 +14,13 @@ import math
 # Prefix for generated features
 GENERATED_PREFIX = "hex#"
 
-
-def _get_user_param(design, name, required=True, param_type="value"):
-    params = design.userParameters
-    p = params.itemByName(name)
-    if not p and required:
-        hint = ""
-        if param_type == "int":
-            hint = "\nCreate it in Modify → Change Parameters as a unitless integer."
-        elif param_type == "length":
-            hint = "\nCreate it in Modify → Change Parameters with a length unit (e.g., mm)."
-        raise RuntimeError(f'Missing user parameter "{name}".{hint}')
-    return p
+# Global variables for command handlers
+_app = None
+_ui = None
+_selected_edge = None
+_selected_face = None
+_face_width = None
+_handlers = []
 
 
 def _get_face_from_edge(edge):
@@ -164,7 +155,7 @@ def _get_face_dimensions_from_edge(face, edge, sketch):
         return (sketch_y_length, sketch_x_length, False, sketch_center_x, sketch_center_y, edge_on_min_x)
 
 
-def _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top=False, start_from_min_y=True):
+def _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top=False, start_from_min_y=True, allow_partial=False):
     """Calculate hexagon size and positions for honeycomb layout.
 
     Default orientation is pointy-top (vertices at top/bottom, flat edges on sides).
@@ -178,42 +169,40 @@ def _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top=Fal
         margin: Gap between adjacent hex edges
         pointy_top: If True, use flat-top hexes instead (flat edges at top/bottom)
         start_from_min_y: If True, start rows from min Y; if False, start from max Y
+        allow_partial: If True, include partial hexes at edges; if False, only full hexes
 
     Returns:
         (radius, centers, pointy_top) - circumradius, list of (x,y) centers, orientation
     """
     sqrt3 = math.sqrt(3)
 
-    # Hex width to fit num_x across with margin between each
-    # face_width = num_x * hex_width + (num_x - 1) * margin
-    hex_width = (face_width - (num_x - 1) * margin) / num_x
-
-    if hex_width <= 0:
-        raise RuntimeError(f"Hexagon margin too large for face width with {num_x} hexagons.")
-
-    # For honeycomb pattern with hexNumX hexes along X:
-    # - Default: flat vertical edges (hexes touch flat-to-flat along X)
-    # - This means vertices point up/down (pointy top/bottom)
-    # - hex_width (flat-to-flat horizontally) = sqrt(3) * r
-    # - hex_height (vertex-to-vertex vertically) = 2 * r
-    #
-    # If pointy_top=True (user override): flat edges at top/bottom instead
-
     if pointy_top:
-        # User wants flat edges at top/bottom (flat-top hex)
+        # Flat-top hex (flat edges at top/bottom, vertices on sides)
         # hex_width (vertex-to-vertex) = 2 * r
         # hex_height (flat-to-flat) = sqrt(3) * r
-        radius = hex_width / 2
+        #
+        # In flat-top honeycomb, same-row hexes are spaced 3r apart (not 2r)
+        # face_width = 2r + (num_x - 1) * (3r + margin)
+        # Solving for r: r = (face_width - (num_x-1) * margin) / (3*num_x - 1)
+        radius = (face_width - (num_x - 1) * margin) / (3 * num_x - 1)
+        if radius <= 0:
+            raise RuntimeError(f"Hexagon margin too large for face width with {num_x} hexagons.")
+        hex_width = 2 * radius
         hex_height = sqrt3 * radius
-        row_spacing = 1.5 * radius + margin * sqrt3 / 2
-        col_spacing = hex_width + margin
+        row_spacing = 0.5 * hex_height + margin * 0.5
+        col_spacing = 3 * radius + margin
     else:
-        # Default honeycomb: pointy top/bottom, flat edges left/right
+        # Pointy-top hex (vertices at top/bottom, flat edges on sides)
         # hex_width (flat-to-flat) = sqrt(3) * r
         # hex_height (vertex-to-vertex) = 2 * r
+        #
+        # face_width = num_x * hex_width + (num_x - 1) * margin
+        hex_width = (face_width - (num_x - 1) * margin) / num_x
+        if hex_width <= 0:
+            raise RuntimeError(f"Hexagon margin too large for face width with {num_x} hexagons.")
         radius = hex_width / sqrt3
         hex_height = 2 * radius
-        row_spacing = 1.5 * radius + margin * sqrt3 / 2
+        row_spacing = 0.75 * hex_height + margin * sqrt3 / 2
         col_spacing = hex_width + margin
 
     # Odd rows offset by half of column spacing
@@ -243,81 +232,100 @@ def _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top=Fal
         start_y = max_y - hex_half_height
         y_direction = -1
 
-    row = 0
+    # For partial hexes, start one row earlier to catch partials on the first edge
+    first_row = -1 if allow_partial else 0
+
+    row = first_row
     while True:
         y = start_y + row * row_spacing * y_direction
 
-        # Y direction: stop only when hex is completely beyond the face (allow overspill)
-        if y_direction > 0:
-            if y - hex_half_height > max_y + 0.001:
-                break
+        # Y direction boundary check
+        if allow_partial:
+            # Stop only when hex is completely beyond the face
+            if y_direction > 0:
+                if y - hex_half_height > max_y + 0.001:
+                    break
+            else:
+                if y + hex_half_height < min_y - 0.001:
+                    break
+            # Also skip if hex is completely before the face (for row -1 check)
+            if y_direction > 0:
+                if y + hex_half_height < min_y - 0.001:
+                    row += 1
+                    continue
+            else:
+                if y - hex_half_height > max_y + 0.001:
+                    row += 1
+                    continue
         else:
-            if y + hex_half_height < min_y - 0.001:
-                break
+            # Stop if hex would extend beyond face (full hexes only)
+            if y_direction > 0:
+                if y + hex_half_height > max_y + 0.001:
+                    break
+            else:
+                if y - hex_half_height < min_y - 0.001:
+                    break
 
-        # Odd rows offset horizontally
-        x_offset = row_x_offset if (row % 2 == 1) else 0
+        # Odd rows offset horizontally (use absolute row index for offset calc)
+        x_offset = row_x_offset if (abs(row) % 2 == 1) else 0
 
-        # X direction: exactly num_x hexes per row (or fewer for offset rows)
-        col = 0
-        while col < num_x:
-            x = start_x + col * col_spacing + x_offset
+        if allow_partial:
+            # Add partial hex on left edge if visible
+            left_hex_x = start_x + x_offset - col_spacing
+            if left_hex_x + hex_half_width > min_x - 0.001:
+                centers.append((left_hex_x, y))
 
-            # Stop if hex right edge would extend beyond face
-            if x + hex_half_width > max_x + 0.001:
-                break
+            # X direction: hexes across the row (allow partial on right)
+            col = 0
+            while True:
+                x = start_x + col * col_spacing + x_offset
 
-            centers.append((x, y))
-            col += 1
+                # Stop if hex is completely beyond face
+                if x - hex_half_width > max_x + 0.001:
+                    break
+
+                centers.append((x, y))
+                col += 1
+        else:
+            # Only full hexes - must fit entirely within face
+            col = 0
+            while col < num_x:
+                x = start_x + col * col_spacing + x_offset
+
+                # Stop if hex right edge would extend beyond face
+                if x + hex_half_width > max_x + 0.001:
+                    break
+
+                centers.append((x, y))
+                col += 1
 
         row += 1
 
     return radius, centers, pointy_top
 
 
-def _run_impl(app, ui):
-    """Main implementation logic."""
-    design = adsk.fusion.Design.cast(app.activeProduct)
-    if not design:
-        ui.messageBox('HexPattern: No active Fusion design.')
-        return
+def _calculate_hex_width(face_width, num_x, margin, pointy_top):
+    """Calculate hex width given parameters."""
+    sqrt3 = math.sqrt(3)
+    if pointy_top:
+        # Flat-top: radius = (face_width - (num_x-1) * margin) / (3*num_x - 1)
+        radius = (face_width - (num_x - 1) * margin) / (3 * num_x - 1)
+        if radius <= 0:
+            return 0
+        return 2 * radius  # hex_width = 2r for flat-top
+    else:
+        # Pointy-top: hex_width directly from face fit
+        hex_width = (face_width - (num_x - 1) * margin) / num_x
+        if hex_width <= 0:
+            return 0
+        return hex_width
 
-    # Check selection - expect an edge
-    sel = ui.activeSelections
-    if sel.count != 1:
-        ui.messageBox('HexPattern: Please select exactly one edge on a rectangular face.\n'
-                      'The edge direction will be used for hexNumX alignment.')
-        return
 
-    edge = adsk.fusion.BRepEdge.cast(sel.item(0).entity)
-    if not edge:
-        ui.messageBox('HexPattern: Please select an edge (not a face or body).\n'
-                      'The edge direction will be used for hexNumX alignment.')
-        return
+def _execute_hex_pattern(face, edge, num_x, margin, pointy_top, allow_partial=False):
+    """Execute the hex pattern cut operation."""
+    global _app, _ui
 
-    # Get the face from the edge
-    face = _get_face_from_edge(edge)
-    if not face:
-        ui.messageBox('HexPattern: Could not find a planar face for this edge.')
-        return
-
-    # Get parameters
-    num_x_param = _get_user_param(design, 'hexNumX', param_type="int")
-    margin_param = _get_user_param(design, 'hexMargin', param_type="length")
-    pointy_param = _get_user_param(design, 'hexPointyTop', required=False)
-
-    num_x = int(round(num_x_param.value))
-    if num_x < 1:
-        ui.messageBox('HexPattern: hexNumX must be at least 1.')
-        return
-
-    margin = margin_param.value  # Internal units (cm)
-
-    # Check pointy top parameter (default: flat-top)
-    pointy_top = False
-    if pointy_param:
-        pointy_val = pointy_param.expression.strip().strip("'\"").upper()
-        pointy_top = pointy_val in ("TRUE", "YES", "1")
+    design = adsk.fusion.Design.cast(_app.activeProduct)
 
     # Start timeline group
     timeline = design.timeline
@@ -330,45 +338,35 @@ def _run_impl(app, ui):
     # Get face dimensions using edge as the width direction
     face_info = _get_face_dimensions_from_edge(face, edge, sketch)
     if not face_info:
-        ui.messageBox('HexPattern: Could not analyze face geometry.')
+        _ui.messageBox('HexPattern: Could not analyze face geometry.')
         return
 
     face_width, face_height, edge_is_along_x, sketch_center_x, sketch_center_y, start_from_min = face_info
 
     # Calculate hex layout
     try:
-        radius, centers, pointy_top = _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top, start_from_min)
+        radius, centers, pointy_top = _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top, start_from_min, allow_partial)
     except RuntimeError as e:
-        ui.messageBox(f'HexPattern: {str(e)}')
+        _ui.messageBox(f'HexPattern: {str(e)}')
         return
 
     if len(centers) == 0:
-        ui.messageBox('HexPattern: No hexagons fit in the selected face.')
+        _ui.messageBox('HexPattern: No hexagons fit in the selected face.')
         return
 
     # Defer compute to batch all sketch operations (much faster)
     sketch.isComputeDeferred = True
 
     # Pre-calculate hexagon point offsets
-    # For honeycomb with hexNumX along X axis, we need:
-    # - Flat edges on left/right (so same-row hexes touch flat-to-flat)
-    # - Diagonal edges on top/bottom (so rows nestle into each other)
-    # This is "pointy-top" orientation: vertices at 90°, 150°, 210°, 270°, 330°, 30°
-    #
-    # The pointy_top parameter lets user flip to "flat-top" if desired
     hex_offsets = []
     for i in range(6):
         if pointy_top:
-            # User requested flat-top: flat edge at top, vertices at 0°, 60°, 120°, 180°, 240°, 300°
             angle = i * math.pi / 3
         else:
-            # Default for honeycomb: pointy-top (vertex at top)
-            # Vertices at 90°, 150°, 210°, 270°, 330°, 30° (starting from top, going CCW)
             angle = math.pi / 2 + i * math.pi / 3
         hex_offsets.append((radius * math.cos(angle), radius * math.sin(angle)))
 
     # Draw all hexagons
-    # Offset all coordinates by the face center in sketch space
     lines = sketch.sketchCurves.sketchLines
     for cx, cy in centers:
         for i in range(6):
@@ -378,17 +376,11 @@ def _run_impl(app, ui):
             hy2 = hex_offsets[(i + 1) % 6][1]
 
             if edge_is_along_x:
-                # Normal orientation: width (hexNumX) along sketch X
-                # cx = position along width (X), cy = position along height (Y)
                 x1 = sketch_center_x + cx + hx1
                 y1 = sketch_center_y + cy + hy1
                 x2 = sketch_center_x + cx + hx2
                 y2 = sketch_center_y + cy + hy2
             else:
-                # Rotated 90°: width (hexNumX) along sketch Y
-                # cx = position along width -> goes to Y
-                # cy = position along height -> goes to X
-                # Hex offsets also rotate 90°: (hx, hy) -> (hy, -hx)
                 x1 = sketch_center_x + cy + hy1
                 y1 = sketch_center_y + cx - hx1
                 x2 = sketch_center_x + cy + hy2
@@ -406,26 +398,24 @@ def _run_impl(app, ui):
     profiles = sketch.profiles
     hex_profiles = adsk.core.ObjectCollection.create()
 
-    # Expected hex area (approximately)
+    # Expected hex area - used to filter profiles
     expected_area = 3 * math.sqrt(3) / 2 * radius * radius
-    # Minimum area to filter out tiny slivers (10% of hex area)
-    min_area = expected_area * 0.1
-    # Maximum area (full hex + some tolerance)
+    # Min area: small enough for corner partials, large enough to exclude margin slivers
+    # Margin slivers are roughly margin * edge_length, which is much smaller than even tiny hex partials
+    min_area = expected_area * 0.03  # 3% of full hex
     max_area = expected_area * 1.1
 
     for i in range(profiles.count):
         profile = profiles.item(i)
         try:
             area = profile.areaProperties().area
-            # Select profiles that are between min and max area
-            # This includes partial hexes at edges but excludes tiny slivers
             if min_area < area <= max_area:
                 hex_profiles.add(profile)
         except:
             pass
 
     if hex_profiles.count == 0:
-        ui.messageBox(
+        _ui.messageBox(
             f'HexPattern: No hexagon profiles found.\n'
             f'Drew {len(centers)} hexagons but could not identify closed profiles.\n'
             f'This may happen if hexagons overlap or extend outside the face.'
@@ -441,7 +431,7 @@ def _run_impl(app, ui):
         cut_feature = extrudes.add(cut_input)
         cut_feature.name = f"{GENERATED_PREFIX}cut"
     except Exception as e:
-        ui.messageBox(f'HexPattern: Cut failed - {str(e)}')
+        _ui.messageBox(f'HexPattern: Cut failed - {str(e)}')
         return
 
     # Group timeline
@@ -453,22 +443,211 @@ def _run_impl(app, ui):
         except:
             pass
 
-    ui.messageBox(
+    _ui.messageBox(
         f'HexPattern: Created {hex_profiles.count} hexagon cuts.\n'
-        f'Hex radius: {radius * 10:.2f} mm'
+        f'Hex width: {_calculate_hex_width(face_width, num_x, margin, pointy_top) * 10:.2f} mm'
     )
 
 
+class HexPatternCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        try:
+            cmd = args.command
+            cmd.setDialogMinimumSize(300, 200)
+            inputs = cmd.commandInputs
+
+            # Add number of hexes input
+            num_input = inputs.addIntegerSpinnerCommandInput('numHexes', 'Number of Hexes', 1, 100, 1, 5)
+
+            # Add hex width info display (directly under number of hexes)
+            hex_width_text = inputs.addTextBoxCommandInput('hexWidthInfo', 'Hex Width', '', 1, True)
+
+            # Add margin input (in mm for display)
+            margin_input = inputs.addValueInput('margin', 'Margin', 'mm', adsk.core.ValueInput.createByReal(0.05))  # 0.5mm default
+
+            # Add orientation radio buttons
+            orientation_group = inputs.addRadioButtonGroupCommandInput('orientation', '')
+            orientation_items = orientation_group.listItems
+            orientation_items.add('Flat Top', True)  # Default selected
+            orientation_items.add('Pointy Top', False)
+
+            # Add partial hexes option
+            inputs.addBoolValueInput('allowPartial', 'Cut partial hexes at edges', True, '', False)
+
+            _update_hex_width_display(inputs)
+
+            # Connect to input changed event
+            onInputChanged = HexPatternInputChangedHandler()
+            cmd.inputChanged.add(onInputChanged)
+            _handlers.append(onInputChanged)
+
+            # Connect to execute event
+            onExecute = HexPatternExecuteHandler()
+            cmd.execute.add(onExecute)
+            _handlers.append(onExecute)
+
+            # Connect to destroy event (for cleanup when dialog closes)
+            onDestroy = HexPatternDestroyHandler()
+            cmd.destroy.add(onDestroy)
+            _handlers.append(onDestroy)
+
+        except:
+            _ui.messageBox('Failed to create command:\n{}'.format(traceback.format_exc()))
+
+
+class HexPatternInputChangedHandler(adsk.core.InputChangedEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        try:
+            _update_hex_width_display(args.inputs)
+        except:
+            pass
+
+
+class HexPatternExecuteHandler(adsk.core.CommandEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        try:
+            global _selected_edge, _selected_face
+
+            inputs = args.command.commandInputs
+
+            num_x = inputs.itemById('numHexes').value
+            margin = inputs.itemById('margin').value  # Already in cm (internal units)
+
+            orientation_group = inputs.itemById('orientation')
+            pointy_top = orientation_group.selectedItem.name == 'Flat Top'
+
+            allow_partial = inputs.itemById('allowPartial').value
+
+            _execute_hex_pattern(_selected_face, _selected_edge, num_x, margin, pointy_top, allow_partial)
+
+        except:
+            _ui.messageBox('Failed to execute:\n{}'.format(traceback.format_exc()))
+
+
+class HexPatternDestroyHandler(adsk.core.CommandEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        # Terminate the script when dialog closes
+        adsk.terminate()
+
+
+def _update_hex_width_display(inputs):
+    """Update the hex width info text based on current inputs."""
+    global _face_width
+
+    if _face_width is None:
+        return
+
+    num_input = inputs.itemById('numHexes')
+    margin_input = inputs.itemById('margin')
+    hex_width_text = inputs.itemById('hexWidthInfo')
+    orientation_group = inputs.itemById('orientation')
+
+    if not all([num_input, margin_input, hex_width_text, orientation_group]):
+        return
+
+    num_x = num_input.value
+    margin = margin_input.value  # Internal units (cm)
+    pointy_top = orientation_group.selectedItem.name == 'Flat Top'
+
+    hex_width = _calculate_hex_width(_face_width, num_x, margin, pointy_top)
+
+    if hex_width <= 0:
+        hex_width_text.text = 'Margin too large'
+    else:
+        # Convert from cm to mm for display
+        hex_width_text.text = f'{hex_width * 10:.2f} mm'
+
+
+def _run_impl(app, ui):
+    """Main implementation logic - validates selection and shows dialog."""
+    global _selected_edge, _selected_face, _face_width
+
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if not design:
+        ui.messageBox('HexPattern: No active Fusion design.')
+        return
+
+    # Check selection - expect an edge
+    sel = ui.activeSelections
+    if sel.count != 1:
+        ui.messageBox('HexPattern: Please select exactly one edge on a rectangular face.\n'
+                      'The edge direction will be used for hex count alignment.')
+        return
+
+    edge = adsk.fusion.BRepEdge.cast(sel.item(0).entity)
+    if not edge:
+        ui.messageBox('HexPattern: Please select an edge (not a face or body).\n'
+                      'The edge direction will be used for hex count alignment.')
+        return
+
+    # Get the face from the edge
+    face = _get_face_from_edge(edge)
+    if not face:
+        ui.messageBox('HexPattern: Could not find a planar face for this edge.')
+        return
+
+    # Store selection for use in dialog
+    _selected_edge = edge
+    _selected_face = face
+
+    # Calculate face width for the dialog
+    # We need a temporary sketch to get face dimensions
+    comp = face.body.parentComponent
+    temp_sketch = comp.sketches.add(face)
+    face_info = _get_face_dimensions_from_edge(face, edge, temp_sketch)
+    temp_sketch.deleteMe()
+
+    if not face_info:
+        ui.messageBox('HexPattern: Could not analyze face geometry.')
+        return
+
+    _face_width = face_info[0]  # Store face width for hex width calculation
+
+    # Create and show the command dialog
+    cmdDefs = ui.commandDefinitions
+
+    # Clean up any existing command definition
+    existing_cmd = cmdDefs.itemById('HexPatternCmd')
+    if existing_cmd:
+        existing_cmd.deleteMe()
+
+    cmd_def = cmdDefs.addButtonDefinition('HexPatternCmd', 'Hex Pattern', 'Create hexagon pattern cutouts')
+
+    onCommandCreated = HexPatternCommandCreatedHandler()
+    cmd_def.commandCreated.add(onCommandCreated)
+    _handlers.append(onCommandCreated)
+
+    cmd_def.execute()
+
+
 def run(context):
-    ui = None
+    global _app, _ui, _handlers
     try:
-        app = adsk.core.Application.get()
-        ui = app.userInterface
-        _run_impl(app, ui)
+        _app = adsk.core.Application.get()
+        _ui = _app.userInterface
+        _handlers = []
+
+        # Prevent script from terminating while dialog is open
+        adsk.autoTerminate(False)
+
+        _run_impl(_app, _ui)
     except Exception:
-        if ui:
-            ui.messageBox('HexPattern failed:\n{}'.format(traceback.format_exc()))
+        if _ui:
+            _ui.messageBox('HexPattern failed:\n{}'.format(traceback.format_exc()))
 
 
 def stop(context):
-    pass
+    # Re-enable auto terminate when script stops
+    adsk.autoTerminate(True)
