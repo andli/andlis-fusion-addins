@@ -11,8 +11,12 @@ import adsk.fusion
 import traceback
 import math
 
-# Prefix for generated features
+# Constants
+SQRT3 = math.sqrt(3)
 GENERATED_PREFIX = "hex#"
+TOLERANCE = 0.001  # Small tolerance for floating point comparisons
+MIN_AREA_RATIO = 0.03  # Minimum profile area as ratio of full hex (filters margin slivers)
+MAX_AREA_RATIO = 1.1  # Maximum profile area as ratio of full hex (filters outer face)
 
 # Global variables for command handlers
 _app = None
@@ -155,54 +159,41 @@ def _get_face_dimensions_from_edge(face, edge, sketch):
         return (sketch_y_length, sketch_x_length, False, sketch_center_x, sketch_center_y, edge_on_min_x)
 
 
-def _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top=False, start_from_min_y=True, allow_partial=False):
+def _calculate_hex_layout(face_width, face_height, num_x, margin, flat_top=False, start_from_min_y=True, allow_partial=False):
     """Calculate hexagon size and positions for honeycomb layout.
 
-    Default orientation is pointy-top (vertices at top/bottom, flat edges on sides).
-    This creates a proper honeycomb where hexes in the same row touch flat-to-flat,
-    and rows nestle into each other via diagonal edges.
-
     Args:
-        face_width: Width of the face (along hexNumX direction)
-        face_height: Height of the face (perpendicular to hexNumX)
+        face_width: Width of the face (along hex count direction)
+        face_height: Height of the face (perpendicular to hex count)
         num_x: Number of hexagons across the width
         margin: Gap between adjacent hex edges
-        pointy_top: If True, use flat-top hexes instead (flat edges at top/bottom)
+        flat_top: If True, flat edges at top/bottom; if False, vertices at top/bottom
         start_from_min_y: If True, start rows from min Y; if False, start from max Y
         allow_partial: If True, include partial hexes at edges; if False, only full hexes
 
     Returns:
-        (radius, centers, pointy_top) - circumradius, list of (x,y) centers, orientation
+        (radius, centers, flat_top) - circumradius, list of (x,y) centers, orientation
     """
-    sqrt3 = math.sqrt(3)
-
-    if pointy_top:
-        # Flat-top hex (flat edges at top/bottom, vertices on sides)
-        # hex_width (vertex-to-vertex) = 2 * r
-        # hex_height (flat-to-flat) = sqrt(3) * r
-        #
-        # In flat-top honeycomb, same-row hexes are spaced 3r apart (not 2r)
-        # face_width = 2r + (num_x - 1) * (3r + margin)
-        # Solving for r: r = (face_width - (num_x-1) * margin) / (3*num_x - 1)
+    if flat_top:
+        # Flat-top hex: flat edges at top/bottom, vertices on sides
+        # hex_width (vertex-to-vertex) = 2r, hex_height (flat-to-flat) = sqrt(3) * r
+        # Same-row hexes spaced 3r apart in honeycomb pattern
         radius = (face_width - (num_x - 1) * margin) / (3 * num_x - 1)
         if radius <= 0:
             raise RuntimeError(f"Hexagon margin too large for face width with {num_x} hexagons.")
         hex_width = 2 * radius
-        hex_height = sqrt3 * radius
+        hex_height = SQRT3 * radius
         row_spacing = 0.5 * hex_height + margin * 0.5
         col_spacing = 3 * radius + margin
     else:
-        # Pointy-top hex (vertices at top/bottom, flat edges on sides)
-        # hex_width (flat-to-flat) = sqrt(3) * r
-        # hex_height (vertex-to-vertex) = 2 * r
-        #
-        # face_width = num_x * hex_width + (num_x - 1) * margin
+        # Pointy-top hex: vertices at top/bottom, flat edges on sides
+        # hex_width (flat-to-flat) = sqrt(3) * r, hex_height (vertex-to-vertex) = 2r
         hex_width = (face_width - (num_x - 1) * margin) / num_x
         if hex_width <= 0:
             raise RuntimeError(f"Hexagon margin too large for face width with {num_x} hexagons.")
-        radius = hex_width / sqrt3
+        radius = hex_width / SQRT3
         hex_height = 2 * radius
-        row_spacing = 0.75 * hex_height + margin * sqrt3 / 2
+        row_spacing = 0.75 * hex_height + margin * SQRT3 / 2
         col_spacing = hex_width + margin
 
     # Odd rows offset by half of column spacing
@@ -301,27 +292,20 @@ def _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top=Fal
 
         row += 1
 
-    return radius, centers, pointy_top
+    return radius, centers, flat_top
 
 
-def _calculate_hex_width(face_width, num_x, margin, pointy_top):
+def _calculate_hex_width(face_width, num_x, margin, flat_top):
     """Calculate hex width given parameters."""
-    sqrt3 = math.sqrt(3)
-    if pointy_top:
-        # Flat-top: radius = (face_width - (num_x-1) * margin) / (3*num_x - 1)
+    if flat_top:
         radius = (face_width - (num_x - 1) * margin) / (3 * num_x - 1)
-        if radius <= 0:
-            return 0
-        return 2 * radius  # hex_width = 2r for flat-top
+        return 2 * radius if radius > 0 else 0
     else:
-        # Pointy-top: hex_width directly from face fit
         hex_width = (face_width - (num_x - 1) * margin) / num_x
-        if hex_width <= 0:
-            return 0
-        return hex_width
+        return hex_width if hex_width > 0 else 0
 
 
-def _execute_hex_pattern(face, edge, num_x, margin, pointy_top, allow_partial=False):
+def _execute_hex_pattern(face, edge, num_x, margin, flat_top, allow_partial=False):
     """Execute the hex pattern cut operation."""
     global _app, _ui
 
@@ -331,7 +315,7 @@ def _execute_hex_pattern(face, edge, num_x, margin, pointy_top, allow_partial=Fa
     timeline = design.timeline
     timeline_start = timeline.markerPosition
 
-    # Create sketch on face first (needed to get sketch coordinates)
+    # Create sketch on face
     comp = face.body.parentComponent
     sketch = comp.sketches.add(face)
 
@@ -345,26 +329,28 @@ def _execute_hex_pattern(face, edge, num_x, margin, pointy_top, allow_partial=Fa
 
     # Calculate hex layout
     try:
-        radius, centers, pointy_top = _calculate_hex_layout(face_width, face_height, num_x, margin, pointy_top, start_from_min, allow_partial)
+        radius, centers, flat_top = _calculate_hex_layout(
+            face_width, face_height, num_x, margin, flat_top, start_from_min, allow_partial
+        )
     except RuntimeError as e:
         _ui.messageBox(f'HexPattern: {str(e)}')
         return
 
-    if len(centers) == 0:
+    if not centers:
         _ui.messageBox('HexPattern: No hexagons fit in the selected face.')
         return
 
     # Defer compute to batch all sketch operations (much faster)
     sketch.isComputeDeferred = True
 
-    # Pre-calculate hexagon point offsets
-    hex_offsets = []
-    for i in range(6):
-        if pointy_top:
-            angle = i * math.pi / 3
-        else:
-            angle = math.pi / 2 + i * math.pi / 3
-        hex_offsets.append((radius * math.cos(angle), radius * math.sin(angle)))
+    # Pre-calculate hexagon vertex offsets from center
+    # Flat-top: first vertex at 0°, Pointy-top: first vertex at 90°
+    start_angle = 0 if flat_top else math.pi / 2
+    hex_offsets = [
+        (radius * math.cos(start_angle + i * math.pi / 3),
+         radius * math.sin(start_angle + i * math.pi / 3))
+        for i in range(6)
+    ]
 
     # Draw all hexagons
     lines = sketch.sketchCurves.sketchLines
@@ -399,11 +385,15 @@ def _execute_hex_pattern(face, edge, num_x, margin, pointy_top, allow_partial=Fa
     hex_profiles = adsk.core.ObjectCollection.create()
 
     # Expected hex area - used to filter profiles
-    expected_area = 3 * math.sqrt(3) / 2 * radius * radius
-    # Min area: small enough for corner partials, large enough to exclude margin slivers
-    # Margin slivers are roughly margin * edge_length, which is much smaller than even tiny hex partials
-    min_area = expected_area * 0.03  # 3% of full hex
-    max_area = expected_area * 1.1
+    expected_area = 3 * SQRT3 / 2 * radius * radius
+    # Min area depends on whether we allow partial hexes:
+    # - With partials: small enough for corner partials, large enough to exclude margin slivers
+    # - Without partials: only full hexes (>90% of expected area)
+    if allow_partial:
+        min_area = expected_area * MIN_AREA_RATIO  # 3% for partial hexes
+    else:
+        min_area = expected_area * 0.90  # 90% for full hexes only
+    max_area = expected_area * MAX_AREA_RATIO
 
     for i in range(profiles.count):
         profile = profiles.item(i)
@@ -445,7 +435,7 @@ def _execute_hex_pattern(face, edge, num_x, margin, pointy_top, allow_partial=Fa
 
     _ui.messageBox(
         f'HexPattern: Created {hex_profiles.count} hexagon cuts.\n'
-        f'Hex width: {_calculate_hex_width(face_width, num_x, margin, pointy_top) * 10:.2f} mm'
+        f'Hex width: {_calculate_hex_width(face_width, num_x, margin, flat_top) * 10:.2f} mm'
     )
 
 
@@ -523,11 +513,11 @@ class HexPatternExecuteHandler(adsk.core.CommandEventHandler):
             margin = inputs.itemById('margin').value  # Already in cm (internal units)
 
             orientation_group = inputs.itemById('orientation')
-            pointy_top = orientation_group.selectedItem.name == 'Flat Top'
+            flat_top = orientation_group.selectedItem.name == 'Flat Top'
 
             allow_partial = inputs.itemById('allowPartial').value
 
-            _execute_hex_pattern(_selected_face, _selected_edge, num_x, margin, pointy_top, allow_partial)
+            _execute_hex_pattern(_selected_face, _selected_edge, num_x, margin, flat_top, allow_partial)
 
         except:
             _ui.messageBox('Failed to execute:\n{}'.format(traceback.format_exc()))
@@ -559,9 +549,9 @@ def _update_hex_width_display(inputs):
 
     num_x = num_input.value
     margin = margin_input.value  # Internal units (cm)
-    pointy_top = orientation_group.selectedItem.name == 'Flat Top'
+    flat_top = orientation_group.selectedItem.name == 'Flat Top'
 
-    hex_width = _calculate_hex_width(_face_width, num_x, margin, pointy_top)
+    hex_width = _calculate_hex_width(_face_width, num_x, margin, flat_top)
 
     if hex_width <= 0:
         hex_width_text.text = 'Margin too large'

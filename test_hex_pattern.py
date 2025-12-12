@@ -25,24 +25,30 @@ class TestHexLayoutGeometry:
     """Tests for _calculate_hex_layout geometry calculations."""
 
     def test_flat_top_dimensions(self):
-        """Verify flat-top hex dimensions: width = 2r, height = sqrt(3)*r."""
-        # Face 100mm wide, 5 hexes, no margin
+        """Verify flat-top hex dimensions: width = 2r, height = sqrt(3)*r.
+
+        Flat-top hexes in honeycomb are spaced 3r apart (center to center in same row).
+        For num_x hexes: face_width = r + (num_x-1)*3r + r = r*(3*num_x - 1)
+        So: radius = face_width / (3*num_x - 1)
+        """
         face_width = 10.0  # cm (internal units)
         face_height = 10.0
         num_x = 5
         margin = 0.0
 
-        radius, centers, pointy = hp._calculate_hex_layout(
-            face_width, face_height, num_x, margin, pointy_top=False
+        radius, centers, flat = hp._calculate_hex_layout(
+            face_width, face_height, num_x, margin, flat_top=True
         )
 
         hex_width = 2 * radius
         hex_height = math.sqrt(3) * radius
 
-        # With 5 hexes and no margin, each hex should be 2cm wide
-        assert abs(hex_width - 2.0) < 0.0001
-        # Height should be sqrt(3) * r = sqrt(3) * 1 = 1.732...
-        assert abs(hex_height - math.sqrt(3)) < 0.0001
+        # With 5 hexes and no margin: radius = 10 / (3*5 - 1) = 10/14 = 0.714...
+        expected_radius = face_width / (3 * num_x - 1)
+        assert abs(radius - expected_radius) < 0.0001
+        # Width = 2r, Height = sqrt(3) * r
+        assert abs(hex_width - 2 * expected_radius) < 0.0001
+        assert abs(hex_height - math.sqrt(3) * expected_radius) < 0.0001
 
     def test_pointy_top_dimensions(self):
         """Verify pointy-top hex dimensions: width = sqrt(3)*r, height = 2r."""
@@ -51,8 +57,8 @@ class TestHexLayoutGeometry:
         num_x = 5
         margin = 0.0
 
-        radius, centers, pointy = hp._calculate_hex_layout(
-            face_width, face_height, num_x, margin, pointy_top=True
+        radius, centers, flat = hp._calculate_hex_layout(
+            face_width, face_height, num_x, margin, flat_top=False
         )
 
         hex_width = math.sqrt(3) * radius
@@ -62,18 +68,22 @@ class TestHexLayoutGeometry:
         assert abs(hex_width - 2.0) < 0.0001
 
     def test_row_spacing_no_margin_flat_top(self):
-        """Row spacing with no margin should be 3/4 * hex_height for flat-top."""
+        """Row spacing with no margin should be 0.5 * hex_height for flat-top.
+
+        For flat-top hexes with no margin, rows interlock with row spacing = 0.5 * hex_height.
+        """
         face_width = 10.0
         face_height = 10.0
         num_x = 5
         margin = 0.0
 
         radius, centers, _ = hp._calculate_hex_layout(
-            face_width, face_height, num_x, margin, pointy_top=False
+            face_width, face_height, num_x, margin, flat_top=True
         )
 
         hex_height = math.sqrt(3) * radius
-        expected_row_spacing = (3 / 4) * hex_height
+        # Code uses: row_spacing = 0.5 * hex_height + margin * 0.5 (margin=0 here)
+        expected_row_spacing = 0.5 * hex_height
 
         # Find centers in row 0 and row 1
         row0_centers = [c for c in centers if abs(c[1] - centers[0][1]) < 0.001]
@@ -85,18 +95,22 @@ class TestHexLayoutGeometry:
         assert abs(actual_row_spacing - expected_row_spacing) < 0.001
 
     def test_column_spacing_same_row(self):
-        """Hexes in same row should be spaced by hex_width + margin."""
+        """Hexes in same row should be spaced by col_spacing.
+
+        For flat-top hexes: col_spacing = 3 * radius + margin
+        For pointy-top hexes: col_spacing = hex_width + margin
+        """
         face_width = 10.0
         face_height = 10.0
         num_x = 5
         margin = 0.1  # 1mm margin
 
         radius, centers, _ = hp._calculate_hex_layout(
-            face_width, face_height, num_x, margin, pointy_top=False
+            face_width, face_height, num_x, margin, flat_top=True
         )
 
-        hex_width = 2 * radius
-        expected_col_spacing = hex_width + margin
+        # Flat-top hexes use col_spacing = 3 * radius + margin
+        expected_col_spacing = 3 * radius + margin
 
         # Get first row centers (sorted by x)
         first_row_y = centers[0][1]
@@ -114,7 +128,7 @@ class TestHexLayoutGeometry:
         margin = 0.0
 
         radius, centers, _ = hp._calculate_hex_layout(
-            face_width, face_height, num_x, margin, pointy_top=False
+            face_width, face_height, num_x, margin, flat_top=True
         )
 
         hex_width = 2 * radius
@@ -142,12 +156,12 @@ class TestHexLayoutGeometry:
 
         # Without margin
         _, centers_no_margin, _ = hp._calculate_hex_layout(
-            face_width, face_height, num_x, 0.0, pointy_top=False
+            face_width, face_height, num_x, 0.0, flat_top=True
         )
 
         # With margin
         _, centers_with_margin, _ = hp._calculate_hex_layout(
-            face_width, face_height, num_x, 0.2, pointy_top=False
+            face_width, face_height, num_x, 0.2, flat_top=True
         )
 
         # With margin, we should have fewer hexes (because they're more spread out)
@@ -164,7 +178,7 @@ class TestHexLayoutGeometry:
         margin = 0.0
 
         radius, centers, _ = hp._calculate_hex_layout(
-            face_width, face_height, num_x, margin, pointy_top=False
+            face_width, face_height, num_x, margin, flat_top=True
         )
 
         # Get first row centers
@@ -199,7 +213,7 @@ class TestHoneycombInterlocking:
         margin = 0.1  # 1mm
 
         radius, centers, _ = hp._calculate_hex_layout(
-            face_width, face_height, num_x, margin, pointy_top=False
+            face_width, face_height, num_x, margin, flat_top=True
         )
 
         sqrt3 = math.sqrt(3)
