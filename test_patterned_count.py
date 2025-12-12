@@ -17,6 +17,7 @@ sys.modules['adsk.core'] = adsk_mock.core
 sys.modules['adsk.fusion'] = adsk_mock.fusion
 
 # Now we can import our module
+sys.path.insert(0, 'PatternedCount')
 import PatternedCount as pc
 
 

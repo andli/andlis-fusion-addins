@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "script",
+    "author": "Andreas Limber",
+    "description": {
+        "": "Creates a honeycomb pattern of hexagonal cuts on a selected face. Configure with hexNumX (count across width) and hexMargin (gap between hexagons)."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
